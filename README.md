@@ -11,6 +11,17 @@ A fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (its
 - **Performance & Visuals (Series X native 4K ladder + `VICTORY_TEXTURE_DROP_MIPS=2`):** `153–172 ms/frame` (`6 FPS`, shortest `107 ms`) at `4,600–6,836 draws/frame`, `96% GPU` at `2595 MHz`, `~7.4–7.6 / 8.0 GB VRAM`, `0` slow-core scheduling.
 - **Key 8 GB VRAM Finding:** Setting `VICTORY_TEXTURE_DROP_MIPS=2` (without `VICTORY_LEVELS_ON_DEMAND=1`) prevents 8 GB VRAM exhaustion so both diffuse textures and indirect lighting probes upload cleanly on the first launch. Adding `VICTORY_RESOLUTION=1920x1080` keeps full Series X lighting while dropping GPU load from `96%` to `51%` and freeing ~2.3 GB VRAM.
 
+## Measured Result (GTX 1660 6 GB / Windows 11 21H2)
+
+- **Hardware:** Windows 11 21H2 (10.0.22000), Intel Core i7-4790K (4C/8T), 24 GB RAM, NVIDIA GeForce GTX 1660 (6 GB, Wave32), driver 617.42, 1920x1080 display; Series X profile.
+- **v9 1080p** (`VICTORY_RESOLUTION=1920x1080` + `TEXTURE_DROP_MIPS=2`): **5-6 FPS / 181-240 ms** at 4,187 draws; GPU 51 % (14-69 ms), CPU 90 % (the limit); **3.98 / 4.93 GB VRAM**; picture normal, black skin fixed, **0** wave64/root-signature/pipeline refusals.
+- **v8 4K** (same tree without the cap): 1.7-3.3 FPS / 302-577 ms; 6.35 / 4.93 GB VRAM (over).
+- **Pure `465b94f`** (no #854/1080p): 2.0-2.5 FPS / 404-501 ms; 7 wave64 refusals; black face.
+- **Slot 0x218** state objects: 2,048 stream pipelines, then `0xC0000005`; not included.
+- **Remaining:** no facial animations, boat sinks, cutscene boats/people.
+- **Windows 11 21H2:** the in-box D3D12 refuses the `0xC01` root-signature flags; this branch adds the Agility SDK 620 exports (`agility.rs`, `build.rs`, `mod agility`) and expects `D3D12Core.dll` 620 beside the exe.
+- Full report: [docs/HARDWARE-GTX1660.md](docs/HARDWARE-GTX1660.md).
+
 ## Quick Build & Run
 
 ```powershell
