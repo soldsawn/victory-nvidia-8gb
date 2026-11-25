@@ -43,6 +43,32 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    // `VICTORY_RESOLUTION=1920x1080`: cap the title's resolution ladder so its
+    // frame is the display's size instead of the console's 4K.
+    let resolution = std::env::var("VICTORY_RESOLUTION").ok().and_then(|text| {
+        let (w, h) = text.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    if let Some((width, height)) = resolution {
+        let base = image.base();
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image is mapped for `size` bytes; the cap rewrites it.
+        let writable =
+            unsafe { victory_loader::make_writable(base as *const core::ffi::c_void, size) };
+        if writable {
+            // SAFETY: writable for `size` bytes, as above.
+            let changed =
+                unsafe { victory_game::output::cap_ladder(base as *mut u8, size, width, height) };
+            println!("resolution     {changed} ladder entry(ies) capped to {width}x{height}");
+            if let Some(at) = unsafe { victory_game::output::assert_site(base as usize, size) } {
+                // SAFETY: `at` lies inside the image, made writable above.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0x90, 1) };
+                println!("resolution     int3 at {at:#x} patched to nop");
+            }
+        } else {
+            eprintln!("resolution     the image could not be made writable; no patch");
+        }
+    }
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),

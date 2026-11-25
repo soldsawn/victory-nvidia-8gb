@@ -60,3 +60,15 @@ pub use windows::{
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+
+/// Makes `size` bytes at `base` writable and executable.
+///
+/// # Safety
+///
+/// `base` starts an image mapped in this process and `size` is its size.
+pub unsafe fn make_writable(base: *const core::ffi::c_void, size: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let mut before = 0u32;
+    // SAFETY: the caller's contract.
+    unsafe { VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut before) != 0 }
+}

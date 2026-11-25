@@ -148,6 +148,18 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// The window's client size: `VICTORY_WINDOW_SIZE` or `VICTORY_RESOLUTION`.
+fn requested_frame() -> Option<(i32, i32)> {
+    static SIZE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let text = std::env::var("VICTORY_WINDOW_SIZE")
+            .or_else(|_| std::env::var("VICTORY_RESOLUTION"))
+            .ok()?;
+        let (w, h) = text.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    })
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -159,6 +171,28 @@ fn hook(hwnd: HWND) {
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        // [patch] Borderless, reachable, and smaller than the screen: a window
+        // that covers the screen exactly is scanned out directly, which shows
+        // black on some drivers, while DWM composes and stretches a smaller one.
+        if let Some((frame_w, frame_h)) = requested_frame() {
+            let percent = std::env::var("VICTORY_WINDOW_PERCENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0 && *v <= 100)
+                .unwrap_or(100);
+            let w = frame_w * percent as i32 / 100;
+            let h = frame_h * percent as i32 / 100;
+            let x = (frame_w - w) / 2;
+            let y = (frame_h - h) / 2;
+            let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+            let popup = (style & !(wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_SYSMENU))
+                | wm::WS_POPUP
+                | wm::WS_VISIBLE;
+            let _ = wm::SetWindowLongW(hwnd, wm::GWL_STYLE, popup as i32);
+            let ex = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE) as u32;
+            let _ = wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, (ex | wm::WS_EX_APPWINDOW) as isize);
+            let _ = wm::SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER);
+        }
     }
 }
 
@@ -168,6 +202,20 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // [patch] Black background instead of the class's white brush.
+    if message == wm::WM_ERASEBKGND {
+        unsafe {
+            use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect};
+            let brush = CreateSolidBrush(0x0000_0000);
+            if !brush.is_null() {
+                let mut rc = RECT::default();
+                let _ = wm::GetClientRect(hwnd, &mut rc);
+                FillRect(wparam as *mut c_void, &rc, brush);
+                let _ = DeleteObject(brush as *mut c_void);
+            }
+        }
+        return 1;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
