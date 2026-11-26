@@ -24,6 +24,33 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+#[cfg(test)]
+mod heap_cache_lifetime_test {
+    /// Exercises the real heap-owned cache and real Shadow destructor. Requires D3D12.
+    #[test]
+    #[ignore = "requires a working D3D12 device"]
+    fn cached_shadows_are_released_with_their_heap() {
+        use std::sync::Arc;
+
+        let host = crate::host::host().expect("D3D12 device");
+        // The first is the actual view-heap path; a sampler heap tests a
+        // second independent owner without allocating a second large heap.
+        let heap_a = crate::descriptor::host::HostHeap::new(false, 4).expect("view heap");
+        let heap_b = crate::descriptor::host::HostHeap::new(true, 4).expect("second heap");
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "heap probing must leave the device usable");
+        let (buffer, data) = host.upload_buffer(65_536).expect("shadow buffer");
+        let shadow = Arc::new(super::Shadow::new(buffer, data, 0, 0, 65_536));
+        let weak = Arc::downgrade(&shadow);
+        heap_a.buffer_ranges.0.lock().unwrap().1.insert(0, (shadow.clone(), 0, 16));
+        heap_b.buffer_ranges.0.lock().unwrap().1.insert(0, (shadow.clone(), 0, 16));
+        drop(shadow);
+        drop(heap_a);
+        assert!(weak.upgrade().is_some(), "the other live heap must retain its range");
+        drop(heap_b);
+        assert!(weak.upgrade().is_none(), "dropping the last heap must release its cached shadow");
+    }
+}
+
 thread_local! {
     /// Room for the journal's answers to this thread's refreshes
     /// (`crate::watch::writes_into`), kept between them.
@@ -1289,19 +1316,25 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Keep at most eight reusable buffers and 512 MiB of capacity in total.
+/// As in upstream Victory at 13f91ca, a single oversized buffer is released.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    if v.capacity() > KEPT {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
+    let mut total = 0usize;
     pool.retain(|v| {
-        seen += 1;
-        total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        let next = total.saturating_add(v.capacity());
+        if next > KEPT {
+            return false;
+        }
+        total = next;
+        true
     });
 }
 
@@ -2211,6 +2244,42 @@ mod merge_tests {
         changed_chunks_into, changed_runs, compare_jobs, give_back, pooled, take_changed,
         take_snapshots,
     };
+
+    #[test]
+    #[ignore = "RAM benchmark: run alone with --ignored --nocapture --test-threads=1"]
+    fn shadow_snapshot_pool_ram() {
+        use super::POOL;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const MIB: usize = 1 << 20;
+        let sample = |phase| {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+            let size = size_of_val(&counters) as u32;
+            // SAFETY: the extended structure fits the supplied buffer and size.
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), size) }, 0);
+            let kept: usize = POOL.lock().unwrap().iter().map(Vec::capacity).sum();
+            println!("{phase},{:.3},{:.3},{:.3}", counters.PrivateUsage as f64 / MIB as f64, counters.WorkingSetSize as f64 / MIB as f64, kept as f64 / MIB as f64);
+        };
+        println!("phase,private_mib,working_set_mib,retained_pool_mib");
+        sample("baseline");
+        let mut buffer = pooled(544 * MIB);
+        buffer.resize(544 * MIB, 0x5a);
+        std::hint::black_box(&buffer);
+        sample("544mib_in_flight");
+        give_back(buffer);
+        sample("after_return");
+        assert!(POOL.lock().unwrap().is_empty(), "oversized snapshot was retained");
+        let mut reusable = pooled(MIB);
+        reusable.resize(MIB, 0x5a);
+        let original = reusable.as_ptr();
+        give_back(reusable);
+        let reused = pooled(MIB);
+        assert_eq!(reused.as_ptr(), original, "ordinary snapshots should still be reused");
+        drop(reused);
+        POOL.lock().unwrap().clear();
+        sample("after_clear");
+    }
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -3883,19 +3952,15 @@ impl Shadow {
             static NOW: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let (start, n) = (self.start as usize, to - from);
-        NOW.with(|now| {
-            let mut now = now.borrow_mut();
-            if now.len() < n {
-                now.resize(n, 0);
-            }
-            if !crate::host::read_into(from as *const u8, &mut now[..n]) {
+        NOW.with(|cache| crate::read_scratch::with_buffer(cache, n, |now| {
+            if !crate::host::read_into(from as *const u8, now) {
                 return false;
             }
             // SAFETY: inside the copy's mapping (`from` and `to` are within
             // the buffer); nothing else writes the CPU side of these bytes
             // while a refresh has them (a refresh is one thread's).
             let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
-            let stretches = changed_chunks(&now[..n], held, COPY_CHANGED_CHUNK);
+            let stretches = changed_chunks(now, held, COPY_CHANGED_CHUNK);
             let mut sent = 0;
             for &(at, len) in &stretches {
                 // SAFETY: as above; the stretch lies inside both.
@@ -3918,7 +3983,7 @@ impl Shadow {
                 );
             }
             true
-        })
+        }))
     }
 
     /// Whether shaders read and write this copy in the card's own memory

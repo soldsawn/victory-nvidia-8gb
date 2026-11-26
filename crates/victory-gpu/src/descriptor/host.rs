@@ -23,7 +23,48 @@ const SLOT_IN_PLACED: u8 = 1 << 1;
 /// [`HostHeap::buffers`].
 const SLOT_IN_BUFFERS: u8 = 1 << 2;
 
+pub(crate) struct BufferRanges<T>(pub(crate) Mutex<(u64, std::collections::HashMap<u32, (std::sync::Arc<T>, u64, u64)>)>);
+
+impl<T> Default for BufferRanges<T> {
+    fn default() -> Self {
+        Self(Mutex::new((0, std::collections::HashMap::new())))
+    }
+}
+
+#[cfg(test)]
+mod buffer_ranges_tests {
+    use super::{BufferRanges, PORTABLE_VIEWS, UNCAPPED_VIEWS, reported_heap_limit};
+    use std::sync::Arc;
+
+    #[test]
+    fn dropping_a_cache_releases_only_its_owned_references() {
+        let first = BufferRanges::default();
+        let second = BufferRanges::default();
+        let resource = Arc::new(vec![0u8; 1024]);
+        let weak = Arc::downgrade(&resource);
+        first.0.lock().unwrap().1.insert(0, (resource.clone(), 0, 1024));
+        second.0.lock().unwrap().1.insert(0, (resource.clone(), 0, 1024));
+        drop(resource);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn view_limit_uses_reported_size_or_conservative_fallback() {
+        assert_eq!(reported_heap_limit(None), PORTABLE_VIEWS);
+        assert_eq!(reported_heap_limit(Some(0)), PORTABLE_VIEWS);
+        assert_eq!(reported_heap_limit(Some(1)), 2);
+        assert_eq!(reported_heap_limit(Some(500_000)), 500_000);
+        assert_eq!(reported_heap_limit(Some(1_000_000)), 1_000_000);
+        assert_eq!(reported_heap_limit(Some(u32::MAX)), UNCAPPED_VIEWS);
+    }
+}
+
 pub(crate) struct HostHeap {
+    /// Buffer-view shadows belong to this heap and must not outlive it.
+    pub(crate) buffer_ranges: BufferRanges<crate::shadow::Shadow>,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     gpu: u64,
@@ -879,30 +920,31 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the structure and size match this feature query.
+        let reported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                std::ptr::from_mut(&mut options).cast(),
+                std::mem::size_of_val(&options) as u32,
+            )
         };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
+        // A failed oversized heap allocation removed the GTX 1650 device,
+        // so never use allocation itself as a capability probe. Older
+        // runtimes without OPTIONS19 get the conservative portable limit.
+        let views = reported_heap_limit(reported.is_ok().then_some(options.MaxViewDescriptorHeapSize));
         tracing::info!(
             views,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
+}
+
+fn reported_heap_limit(reported: Option<u32>) -> u32 {
+    // Zero is the shader's sentinel for no limit, so a reported one-slot
+    // heap uses two here and is subsequently rejected as too small.
+    reported.filter(|&views| views != 0).map_or(PORTABLE_VIEWS, |views| views.clamp(2, UNCAPPED_VIEWS))
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
@@ -970,6 +1012,10 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        if !sampler && null != 0 && null <= extra {
+            tracing::warn!(null, extra, "host view heap too small for dynamic slots");
+            return None;
+        }
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1026,6 +1072,7 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            buffer_ranges: BufferRanges::default(),
             heap,
             cpu,
             gpu,

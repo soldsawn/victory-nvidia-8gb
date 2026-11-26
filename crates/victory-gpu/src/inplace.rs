@@ -500,13 +500,21 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         heaps.remove(&section);
     }
     // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
+    // number shows that section's pages, not this one's: release it before
+    // a later store maps the new section.
     let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
     if gone.is_some() {
         tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
     }
+}
+
+/// The runtime is closing its last reference to this physical section.
+/// Its title views are gone; remove the census entry and our cached view
+/// before the numeric handle can be reused by another section.
+pub fn title_memory_section_closed(section: usize) {
+    views_write().sections.retain(|s| s.0 != section);
+    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section));
+    drop(gone);
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -695,6 +703,17 @@ struct Own {
     base: usize,
     bytes: u64,
     committed: Vec<u64>,
+}
+
+impl Drop for Own {
+    fn drop(&mut self) {
+        // SAFETY: this owns the whole view returned by MapViewOfFile; the
+        // OWN mutex excludes writes through it while it is removed.
+        let ok = unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }) };
+        if ok == 0 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), "could not unmap our physical-section view");
+        }
+    }
 }
 
 /// Our own views by section handle; `None` in a section's place if the
@@ -1492,6 +1511,85 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "synthetic physical-section RAM measurement; run alone"]
+    fn own_view_section_memory() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const MIB: usize = 1 << 20;
+        const SECTION_BYTES: usize = 32 * MIB;
+        let sample = |phase: &str| {
+            let mut process = PROCESS_MEMORY_COUNTERS_EX::default();
+            process.cb = std::mem::size_of_val(&process) as u32;
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&mut process as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), process.cb) }, 0);
+            let mut system = PERFORMANCE_INFORMATION::default();
+            system.cb = std::mem::size_of_val(&system) as u32;
+            assert_ne!(unsafe { K32GetPerformanceInfo(&mut system, system.cb) }, 0);
+            println!("{phase},private_mib={:.2},working_set_mib={:.2},system_commit_mib={:.2}", process.PrivateUsage as f64 / MIB as f64, process.WorkingSetSize as f64 / MIB as f64, (system.CommitTotal * system.PageSize) as f64 / MIB as f64);
+        };
+        sample("baseline");
+        let mut handles = Vec::new();
+        let mut own_bases = Vec::new();
+        for _ in 0..4 {
+            let handle = unsafe { mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SECTION_BYTES as u32, std::ptr::null()) };
+            assert!(!handle.is_null());
+            let title = unsafe { mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, SECTION_BYTES) };
+            assert!(!title.Value.is_null());
+            unsafe { std::ptr::write_bytes(title.Value.cast::<u8>(), 0x5a, SECTION_BYTES) };
+            let section = handle as usize;
+            title_memory_section(section, SECTION_BYTES as u64, true);
+            title_memory_view(title.Value as usize, SECTION_BYTES, section, 0);
+            assert!(write_own(title.Value as usize, &[0x5a]).is_some());
+            own_bases.push(OWN.lock().unwrap().as_ref().unwrap().get(&section).unwrap().as_ref().unwrap().base);
+            views_gone(title.Value as usize, SECTION_BYTES);
+            assert_ne!(unsafe { mem::UnmapViewOfFile(title) }, 0);
+            handles.push(handle);
+        }
+        sample("before_handle_close");
+        for &handle in &handles {
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
+        }
+        // Simulate the old missing section-close notification, then clean up.
+        sample("old_path_after_close");
+        for (&handle, &base) in handles.iter().zip(&own_bases) {
+            let mut info = mem::MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(unsafe { mem::VirtualQuery(base as *const c_void, &mut info, std::mem::size_of_val(&info)) }, 0);
+            assert_eq!(info.State, mem::MEM_COMMIT);
+            title_memory_section_closed(handle as usize);
+            assert_ne!(unsafe { mem::VirtualQuery(base as *const c_void, &mut info, std::mem::size_of_val(&info)) }, 0);
+            assert_eq!(info.State, mem::MEM_FREE);
+        }
+        sample("after_cleanup");
+    }
+
+    #[test]
+    fn section_close_releases_own_view_after_title_view_is_gone() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+
+        // Create real section and title view without game memory or a GPU.
+        let handle = unsafe { mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, K64 as u32, std::ptr::null()) };
+        assert!(!handle.is_null());
+        let title = unsafe { mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, K64) };
+        assert!(!title.Value.is_null());
+        let section = handle as usize;
+        title_memory_section(section, K64 as u64, true);
+        title_memory_view(title.Value as usize, K64, section, 0);
+        assert!(write_own(title.Value as usize, &[0x5a]).is_some());
+        assert_eq!(unsafe { title.Value.cast::<u8>().read() }, 0x5a);
+        let own_base = OWN.lock().unwrap().as_ref().unwrap().get(&section).unwrap().as_ref().unwrap().base;
+        views_gone(title.Value as usize, K64);
+        assert_ne!(unsafe { mem::UnmapViewOfFile(title) }, 0);
+        title_memory_section_closed(section);
+        assert!(views_read().sections.iter().all(|s| s.0 != section));
+        assert!(!OWN.lock().unwrap().as_ref().unwrap().contains_key(&section));
+        let mut info = mem::MEMORY_BASIC_INFORMATION::default();
+        assert_ne!(unsafe { mem::VirtualQuery(own_base as *const c_void, &mut info, std::mem::size_of_val(&info)) }, 0);
+        assert_eq!(info.State, mem::MEM_FREE, "our view must actually be unmapped");
+        assert_ne!(unsafe { CloseHandle(handle) }, 0);
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

@@ -562,13 +562,7 @@ thread_local! {
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    READ.with(|read| {
-        let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
-        }
-        f(&mut read[..size])
-    })
+    READ.with(|read| crate::read_scratch::with_buffer(read, size, f))
 }
 
 /// Whether a texture all of whose memory is mapped is read through the
@@ -1713,6 +1707,101 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
+    #[test]
+    #[ignore = "synthetic host-copy throughput measurement; run alone in release mode"]
+    fn texture_read_copy_throughput() {
+        use std::cell::RefCell;
+        use std::time::Instant;
+        const MIB: usize = 1 << 20;
+        const ITERATIONS: usize = 12;
+        for size_mib in [16, 32, 33, 64] {
+            let source = vec![0x5au8; size_mib * MIB];
+            for policy in ["retained", "bounded", "shared_prototype"] {
+                let cache = RefCell::new(Vec::<u8>::new());
+                let shared = crate::read_scratch::benchmarks::SharedPrototype::default();
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let read = |dest: &mut [u8]| {
+                        crate::host::copy_mapped(dest.as_mut_ptr(), source.as_ptr(), source.len(), false);
+                        assert_eq!(std::hint::black_box(dest[0]), 0x5a);
+                        assert_eq!(std::hint::black_box(dest[dest.len() - 1]), 0x5a);
+                    };
+                    if policy == "shared_prototype" {
+                        shared.with_buffer(&cache, source.len(), read);
+                    } else if policy == "bounded" {
+                        crate::read_scratch::with_buffer(&cache, source.len(), read);
+                    } else {
+                        let mut dest = cache.borrow_mut();
+                        dest.resize(source.len(), 0);
+                        read(&mut dest);
+                    }
+                }
+                println!("size_mib={size_mib} policy={policy} mean_ms={:.3} retained_mib={:.1}",
+                    start.elapsed().as_secs_f64() * 1000.0 / ITERATIONS as f64,
+                    (cache.borrow().capacity() + shared.retained()) as f64 / MIB as f64);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "RAM benchmark: run alone with --ignored --nocapture --test-threads=1"]
+    fn texture_scratch_ram() {
+        use super::{READ, with_read};
+        use std::sync::Barrier;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const WORKERS: usize = 4;
+        const MIB: usize = 1 << 20;
+        let memory = |phase: &str, retained: Option<usize>| {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+            let size = size_of_val(&counters) as u32;
+            // SAFETY: the extended structure fits the supplied buffer and size.
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), size) }, 0);
+            let retained = retained.map_or_else(String::new, |bytes| format!("{:.3}", bytes as f64 / MIB as f64));
+            println!("{phase},{:.3},{:.3},{retained},{:.3}", counters.PrivateUsage as f64 / MIB as f64, counters.WorkingSetSize as f64 / MIB as f64, crate::read_scratch::shared_retained() as f64 / MIB as f64);
+        };
+        println!("phase,private_mib,working_set_mib,retained_thread_scratch_mib,retained_shared_scratch_mib");
+        memory("baseline", Some(0));
+        let gate = Barrier::new(WORKERS + 1);
+        let sizes = [64 * MIB, 96 * MIB, 128 * MIB];
+        let capacities: [std::sync::atomic::AtomicUsize; WORKERS] = Default::default();
+        use std::sync::atomic::Ordering::Relaxed;
+        std::thread::scope(|scope| {
+            for capacity in &capacities {
+                let gate = &gate;
+                scope.spawn(move || {
+                    for size in sizes {
+                        with_read(size, |bytes| {
+                            bytes.fill(0x5a);
+                            std::hint::black_box(bytes);
+                            gate.wait();
+                            gate.wait();
+                        });
+                        with_read(MIB, |bytes| std::hint::black_box(bytes[0]));
+                        capacity.store(READ.with(|read| read.borrow().capacity()), Relaxed);
+                        gate.wait();
+                        gate.wait();
+                    }
+                });
+            }
+            for size in sizes {
+                gate.wait();
+                memory(format!("{}mib_in_flight", size / MIB).as_str(), None);
+                gate.wait();
+                gate.wait();
+                memory(format!("{}mib_after_small_read", size / MIB).as_str(), Some(capacities.iter().map(|n| n.load(Relaxed)).sum()));
+                gate.wait();
+            }
+        });
+        memory("workers_exited", Some(0));
+        assert!(capacities.iter().all(|n| n.load(Relaxed) == MIB));
+
+        // Crossing the midpoint must not round capacity up above the limit.
+        with_read(24 * MIB, |bytes| bytes[0] = 0x5a);
+        with_read(29 * MIB, |bytes| assert_eq!(bytes[0], 0x5a));
+        assert!(READ.with(|read| read.borrow().capacity()) <= 32 * MIB);
+    }
     use super::with_title;
 
     /// Title memory whose tail is reserved and not committed reads through

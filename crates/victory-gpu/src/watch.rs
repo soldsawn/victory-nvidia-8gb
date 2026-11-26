@@ -26,6 +26,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+#[cfg(test)]
+mod journal_ram_measurement {
+    /// Measures journal metadata only, with no game memory or global journal.
+    #[test]
+    #[ignore = "synthetic RAM measurement; run in isolation with --nocapture"]
+    fn journal_distinct_pages() {
+        use std::collections::BTreeMap;
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        fn private_bytes() -> usize {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+            let size = std::mem::size_of_val(&counters) as u32;
+            counters.cb = size;
+            assert_ne!(unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), size) }, 0);
+            counters.PrivateUsage
+        }
+
+        let baseline = private_bytes();
+        let mut written = BTreeMap::<usize, u64>::new();
+        for pages in [65_536usize, 262_144, 1_048_576] {
+            while written.len() < pages {
+                written.insert(written.len(), 1);
+            }
+            println!("pages={pages} represented_gib={} private_delta_mib={:.2}", pages / 16_384, private_bytes().saturating_sub(baseline) as f64 / 1_048_576.0);
+        }
+        std::hint::black_box(&written);
+        drop(written);
+        println!("after_drop_private_delta_mib={:.2}", private_bytes().saturating_sub(baseline) as f64 / 1_048_576.0);
+    }
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.

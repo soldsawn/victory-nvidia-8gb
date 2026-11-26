@@ -551,6 +551,7 @@ impl Drop for MappedBase {
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_closed(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -1525,6 +1526,23 @@ mod tests {
         assert!(!fresh.committed(1));
     }
     use super::*;
+
+    #[test]
+    fn section_lives_until_freed_pages_and_last_mapping_are_gone() {
+        let pages = allocate(1);
+        let weak = {
+            let physical = physical();
+            Arc::downgrade(&physical.pages.get(&pages[0]).unwrap().section)
+        };
+        let address = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!address.is_null());
+        assert_eq!(XMemMapPhysicalPages(address, 1, pages.as_ptr()), address);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert!(weak.upgrade().is_some(), "mapped views hold the section alive");
+        assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+        assert!(weak.upgrade().is_none(), "the last mapping must release the section");
+        assert_ne!(unsafe { VirtualFree(address, 0, MEM_RELEASE) }, 0);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
